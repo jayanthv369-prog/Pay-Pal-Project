@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { usePayment } from '../context/PaymentContext';
 import { useNetwork } from '../context/NetworkContext';
+import { api } from '../utils/api';
 import ConfidenceBadge from '../components/ConfidenceBadge';
 import { 
   RefreshCw, 
@@ -44,7 +45,17 @@ export default function SmartRecovery() {
     const recipient = 'grocery-mart@icici';
     const recipientName = 'Apollo Pharmacy & Essentials';
 
-    // Step 1: Acquire client-side idempotency lock
+    // Step 1: Acquire client & backend idempotency lock
+    try {
+      await api.registerRecoveryTransaction({
+        idempotencyKey,
+        amount,
+        recipient,
+        recipientName,
+        channel: 'UPI_ONLINE',
+        state: 'OUTCOME_UNKNOWN',
+      });
+    } catch (e) { /* fallback to local */ }
     await new Promise((r) => setTimeout(r, 800));
     setActiveStep(2); // Step 2: Sending payment instruction to bank
 

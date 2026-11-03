@@ -24,7 +24,7 @@ export default function CreditBridge() {
   const [activationResult, setActivationResult] = useState(null);
   const [errorMsg, setErrorMsg] = useState('');
 
-  const handleActivate = (e) => {
+  const handleActivate = async (e) => {
     e.preventDefault();
     if (!consentChecked) {
       setErrorMsg('Explicit user consent is mandatory before activating simulated temporary credit.');
@@ -32,17 +32,17 @@ export default function CreditBridge() {
     }
     setErrorMsg('');
 
-    const res = activateCreditBridge({
+    const res = await activateCreditBridge({
       targetTxnId: `TXN-STUCK-${Date.now()}`,
       amount: parseFloat(amount),
       recipient,
       recipientName,
     });
 
-    if (res.success) {
+    if (res && res.success) {
       setActivationResult(res);
     } else {
-      setErrorMsg(res.message);
+      setErrorMsg(res?.message || 'Failed to activate credit bridge');
     }
   };
 

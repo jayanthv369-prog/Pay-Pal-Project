@@ -1,6 +1,7 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { usePayment } from '../context/PaymentContext';
 import { useNetwork } from '../context/NetworkContext';
+import { api } from '../utils/api';
 import ConfidenceBadge from '../components/ConfidenceBadge';
 import { 
   ShieldCheck, 
@@ -20,18 +21,36 @@ import {
 } from 'lucide-react';
 
 export default function Dashboard({ setActiveTab }) {
-  const { transactions, setSelectedTxnForExplanation, reconcileTransaction, offlinePassports } = usePayment();
+  const { transactions, setSelectedTxnForExplanation, reconcileTransaction, retryPayment, offlinePassports } = usePayment();
   const { networkMode } = useNetwork();
   const [filterState, setFilterState] = useState('ALL');
   const [searchTerm, setSearchTerm] = useState('');
+  const [apiStats, setApiStats] = useState(null);
 
-  // Metrics calculations
-  const recoveredTxns = transactions.filter(t => t.logs?.some(l => l.event?.includes('RECONCILED')));
-  const recoveredAmount = recoveredTxns.reduce((sum, t) => sum + (parseFloat(t.amount) || 0), 0) + 1450.00;
-  
+  // Fetch real statistics from database API
+  useEffect(() => {
+    let isMounted = true;
+    api.fetchDashboardStats()
+      .then(data => {
+        if (isMounted && data) {
+          setApiStats(data);
+        }
+      })
+      .catch(err => {
+        console.warn('Dashboard stats API fetch note (using calculated stats):', err.message);
+      });
+    return () => { isMounted = false; };
+  }, [transactions]);
+
+  // Real Database Metrics calculations (API backed with calculated fallback)
   const pendingTxns = transactions.filter(t => t.state === 'PENDING_VERIFICATION' || t.state === 'OUTCOME_UNKNOWN');
-  const offlineTokensCount = transactions.filter(t => t.state === 'OFFLINE_AUTHORIZATION').length;
-  const scamThreatsBlocked = transactions.filter(t => t.state === 'NEEDS_REVIEW').length + 3;
+  const recoveredTxns = transactions.filter(t => t.reconciliationStatus === 'RECONCILED' && t.state === 'CONFIRMED');
+  const calculatedRecoveredAmount = recoveredTxns.reduce((sum, t) => sum + (parseFloat(t.amount) || 0), 0);
+
+  const recoveredAmount = apiStats ? apiStats.recoveredFunds : calculatedRecoveredAmount;
+  const pendingCount = apiStats ? apiStats.pendingCount : pendingTxns.length;
+  const offlineTokensCount = apiStats ? apiStats.offlineCount : transactions.filter(t => t.state === 'OFFLINE_AUTHORIZATION').length;
+  const scamThreatsBlocked = apiStats ? apiStats.scamThreatsBlocked : transactions.filter(t => t.state === 'NEEDS_REVIEW').length;
 
   // Filtered transactions
   const filteredTransactions = transactions.filter(t => {
@@ -118,7 +137,7 @@ export default function Dashboard({ setActiveTab }) {
             </div>
           </div>
           <div className="mt-3">
-            <div className="text-2xl font-black text-white">{pendingTxns.length}</div>
+            <div className="text-2xl font-black text-white">{pendingCount}</div>
             <p className="text-[11px] text-amber-400 flex items-center gap-1 mt-1 font-medium">
               Idempotency locked for verification
             </p>
@@ -324,6 +343,24 @@ export default function Dashboard({ setActiveTab }) {
                           <RefreshCw className="w-3 h-3" />
                           Reconcile
                         </button>
+                      ) : txn.state === 'FAILED' ? (
+                        <>
+                          <button
+                            onClick={() => retryPayment(txn.id)}
+                            className="px-2.5 py-1 bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-400 border border-emerald-500/30 rounded-lg text-xs font-semibold inline-flex items-center gap-1 transition-all"
+                            title="Retry failed payment with a new idempotency key"
+                          >
+                            <RefreshCw className="w-3 h-3" />
+                            Retry
+                          </button>
+                          <button
+                            onClick={() => setSelectedTxnForExplanation(txn)}
+                            className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-medium inline-flex items-center gap-1 border border-slate-700 transition-colors"
+                          >
+                            <span>Diagnose</span>
+                            <ExternalLink className="w-3 h-3" />
+                          </button>
+                        </>
                       ) : (
                         <button
                           onClick={() => setSelectedTxnForExplanation(txn)}

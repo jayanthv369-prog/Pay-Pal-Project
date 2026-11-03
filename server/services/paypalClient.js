@@ -1,23 +1,46 @@
 // PayPal Developer Sandbox Service Client
 // Uses PayPal REST API v2 directly for zero-dependency reliability and full OAuth2 spec compliance.
 
-const PAYPAL_API_BASE = process.env.PAYPAL_MODE === 'live' 
-  ? 'https://api-m.paypal.com' 
+import { getDatabase } from '../config/database.js';
+import {
+  createTransaction,
+  getTransactionById,
+  getTransactionByIdempotencyKey,
+  updateTransactionState,
+  TRANSACTION_STATES
+} from './transactionService.js';
+
+const PAYPAL_API_BASE = process.env.PAYPAL_MODE === 'live'
+  ? 'https://api-m.paypal.com'
   : 'https://api-m.sandbox.paypal.com';
 
 let cachedAccessToken = null;
 let tokenExpiresAt = 0;
 
 /**
+ * Check whether valid PayPal credentials are configured in server/.env
+ */
+export function isPayPalConfigured() {
+  const clientId = process.env.PAYPAL_CLIENT_ID;
+  const clientSecret = process.env.PAYPAL_CLIENT_SECRET;
+  return Boolean(
+    clientId &&
+    clientSecret &&
+    clientId !== 'your_paypal_sandbox_client_id_here' &&
+    clientSecret !== 'your_paypal_sandbox_client_secret_here'
+  );
+}
+
+/**
  * Fetch OAuth2 Bearer Access Token from PayPal Sandbox
  */
 export async function getPayPalAccessToken() {
-  const clientId = process.env.PAYPAL_CLIENT_ID;
-  const clientSecret = process.env.PAYPAL_CLIENT_SECRET;
-
-  if (!clientId || !clientSecret || clientId === 'your_paypal_sandbox_client_id_here') {
+  if (!isPayPalConfigured()) {
     return { configured: false, token: null };
   }
+
+  const clientId = process.env.PAYPAL_CLIENT_ID;
+  const clientSecret = process.env.PAYPAL_CLIENT_SECRET;
 
   // Reuse cached token if valid with 60s buffer
   if (cachedAccessToken && Date.now() < tokenExpiresAt - 60000) {
@@ -26,45 +49,98 @@ export async function getPayPalAccessToken() {
 
   const auth = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
 
-  const response = await fetch(`${PAYPAL_API_BASE}/v1/oauth2/token`, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Basic ${auth}`,
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
-    body: 'grant_type=client_credentials',
-  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10000);
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`PayPal Auth Failed (${response.status}): ${errorText}`);
+  try {
+    const response = await fetch(`${PAYPAL_API_BASE}/v1/oauth2/token`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${auth}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: 'grant_type=client_credentials',
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`PayPal Auth Failed (${response.status}): ${errorText}`);
+    }
+
+    const data = await response.json();
+    cachedAccessToken = data.access_token;
+    tokenExpiresAt = Date.now() + (data.expires_in * 1000);
+
+    return { configured: true, token: cachedAccessToken };
+  } catch (err) {
+    clearTimeout(timeoutId);
+    throw err;
   }
-
-  const data = await response.json();
-  cachedAccessToken = data.access_token;
-  tokenExpiresAt = Date.now() + (data.expires_in * 1000);
-
-  return { configured: true, token: cachedAccessToken };
 }
 
 /**
- * Create a PayPal Order in Sandbox
+ * Create a PayPal Order in Sandbox and register in local transaction database
  */
-export async function createPayPalOrder({ amount, currency = 'USD', description = 'PayBastion Sandbox Transaction' }) {
+export async function createPayPalOrder({
+  amount,
+  currency = 'USD',
+  description = 'PayBastion Sandbox Transaction',
+}, db = null) {
+  const database = db || getDatabase();
+
+  const numAmount = parseFloat(amount);
+  if (isNaN(numAmount) || numAmount <= 0) {
+    throw new Error('Valid positive amount is required');
+  }
+
   const { configured, token } = await getPayPalAccessToken();
+  const clientOrigin = process.env.CLIENT_ORIGIN || 'http://localhost:5173';
 
   if (!configured) {
-    // High-fidelity sandbox mock mode when user hasn't added credentials yet
+    // Explicit DEMO MODE when credentials are not configured
     const simulatedOrderId = `SANDBOX-DEMO-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
+
+    // Register demo order in persistent transaction database
+    const txn = createTransaction({
+      id: `PP-${simulatedOrderId}`,
+      idempotencyKey: `IDEMP-PP-${simulatedOrderId}`,
+      amount: numAmount,
+      currency,
+      sender: 'demo-buyer@paypal.sandbox',
+      recipient: 'merchant-sandbox@paybastion.dev',
+      recipientName: 'PayBastion Merchant Gateway',
+      category: 'PayPal Demo Checkout',
+      channel: 'PAYPAL_SANDBOX',
+      state: TRANSACTION_STATES.PENDING_VERIFICATION,
+      confidenceScore: 60,
+      isSimulation: true,
+      userExplanation: 'Simulated PayPal Sandbox order created. Demo credentials active.',
+      technicalDiagnosis: 'DEMO MODE: No live credentials provided in server/.env.',
+      safeToRetry: false,
+      needsReconciliation: true,
+      logs: [
+        {
+          timestamp: new Date().toISOString(),
+          event: 'PAYPAL_ORDER_CREATED_DEMO',
+          detail: `Created simulated PayPal sandbox order ${simulatedOrderId}`,
+        },
+      ],
+    }, database);
+
     return {
       success: true,
       demoMode: true,
+      isSimulation: true,
       orderId: simulatedOrderId,
       status: 'CREATED',
-      amount,
+      amount: numAmount,
       currency,
-      message: 'Demo Sandbox Order generated (Configure PAYPAL_CLIENT_ID & PAYPAL_CLIENT_SECRET in server/.env for live sandbox API)',
-      approveUrl: `https://www.sandbox.paypal.com/checkoutnow?token=${simulatedOrderId}`
+      message: 'Simulated Sandbox Demo Order generated (Configure PAYPAL_CLIENT_ID & PAYPAL_CLIENT_SECRET for live sandbox API)',
+      approveUrl: `https://www.sandbox.paypal.com/checkoutnow?token=${simulatedOrderId}`,
+      transaction: txn,
     };
   }
 
@@ -72,10 +148,10 @@ export async function createPayPalOrder({ amount, currency = 'USD', description 
     intent: 'CAPTURE',
     purchase_units: [
       {
-        description: description.substring(0, 127),
+        description: (description || 'PayBastion Sandbox Transaction').substring(0, 127),
         amount: {
           currency_code: currency,
-          value: parseFloat(amount).toFixed(2),
+          value: numAmount.toFixed(2),
         },
       },
     ],
@@ -83,119 +159,285 @@ export async function createPayPalOrder({ amount, currency = 'USD', description 
       brand_name: 'PayBastion AI Resilience',
       landing_page: 'NO_PREFERENCE',
       user_action: 'PAY_NOW',
-      return_url: 'http://localhost:5173/paypal-return',
-      cancel_url: 'http://localhost:5173/paypal-cancel',
+      return_url: `${clientOrigin}/paypal-return`,
+      cancel_url: `${clientOrigin}/paypal-cancel`,
     },
   };
 
-  const response = await fetch(`${PAYPAL_API_BASE}/v2/checkout/orders`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${token}`,
-      'Prefer': 'return=representation',
-    },
-    body: JSON.stringify(payload),
-  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 12000);
 
-  const data = await response.json();
-  if (!response.ok) {
-    throw new Error(data.message || `PayPal Order Creation Error (${response.status})`);
+  try {
+    const response = await fetch(`${PAYPAL_API_BASE}/v2/checkout/orders`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`,
+        'Prefer': 'return=representation',
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeoutId);
+    const data = await response.json();
+
+    if (!response.ok) {
+      throw new Error(data.message || `PayPal Order Creation Error (${response.status})`);
+    }
+
+    const approveLink = data.links?.find(link => link.rel === 'approve')?.href;
+
+    // Register in local transactions table
+    const txn = createTransaction({
+      id: `PP-${data.id}`,
+      idempotencyKey: `IDEMP-PP-${data.id}`,
+      amount: numAmount,
+      currency,
+      sender: 'sandbox-buyer@paypal.com',
+      recipient: 'merchant-sandbox@paybastion.dev',
+      recipientName: 'PayBastion Merchant Gateway',
+      category: 'PayPal Sandbox Checkout',
+      channel: 'PAYPAL_SANDBOX',
+      state: TRANSACTION_STATES.PENDING_VERIFICATION,
+      confidenceScore: 70,
+      isSimulation: false,
+      userExplanation: 'PayPal order created in Developer Sandbox. Awaiting approval and capture.',
+      technicalDiagnosis: `PayPal Order ${data.id} registered. Gateway status ${data.status}.`,
+      safeToRetry: false,
+      needsReconciliation: true,
+      logs: [
+        {
+          timestamp: new Date().toISOString(),
+          event: 'PAYPAL_ORDER_CREATED',
+          detail: `Official PayPal order ${data.id} registered with state ${data.status}`,
+        },
+      ],
+    }, database);
+
+    return {
+      success: true,
+      demoMode: false,
+      isSimulation: false,
+      orderId: data.id,
+      status: data.status,
+      approveUrl: approveLink,
+      details: data,
+      transaction: txn,
+    };
+  } catch (err) {
+    clearTimeout(timeoutId);
+    throw err;
   }
-
-  const approveLink = data.links?.find(link => link.rel === 'approve')?.href;
-
-  return {
-    success: true,
-    demoMode: false,
-    orderId: data.id,
-    status: data.status,
-    approveUrl: approveLink,
-    details: data,
-  };
 }
 
 /**
- * Capture an Approved PayPal Order
+ * Capture an Approved PayPal Order and verify before marking CONFIRMED
  */
-export async function capturePayPalOrder(orderId) {
+export async function capturePayPalOrder(orderId, db = null) {
+  const database = db || getDatabase();
+
+  if (!orderId) {
+    throw new Error('orderId is required for PayPal capture');
+  }
+
+  // Security check: Check that orderId belongs to a locally registered transaction
+  const localTxn = getTransactionById(`PP-${orderId}`, database) ||
+                   getTransactionByIdempotencyKey(`IDEMP-PP-${orderId}`, database) ||
+                   getTransactionById(orderId, database);
+
+  if (!localTxn) {
+    throw new Error(`Security validation failed: PayPal order ${orderId} is not associated with a registered local transaction.`);
+  }
+
+  // Prevent duplicate capture if already confirmed
+  if (localTxn.state === 'CONFIRMED') {
+    return {
+      success: true,
+      duplicatePrevented: true,
+      alreadyCaptured: true,
+      orderId,
+      status: 'COMPLETED',
+      captureId: localTxn.providerReference,
+      message: 'Order was already captured and confirmed in database. Duplicate capture prevented.',
+      transaction: localTxn,
+    };
+  }
+
   const { configured, token } = await getPayPalAccessToken();
 
   if (!configured || orderId.startsWith('SANDBOX-DEMO-')) {
+    // Explicit DEMO capture simulation
     const captureId = `CAP-DEMO-${Date.now()}`;
+    const completedAt = new Date().toISOString();
+
+    const updated = updateTransactionState(localTxn.id, TRANSACTION_STATES.CONFIRMED, {
+      confidenceScore: 95,
+      providerReference: captureId,
+      reconciliationStatus: 'RECONCILED',
+      safeToRetry: false,
+      needsReconciliation: false,
+      explanation: {
+        userExplanation: 'Simulated Sandbox payment completed (DEMO MODE).',
+        technicalDiagnosis: 'Simulated PayPal Sandbox capture verified without live credentials.',
+        safeToRetry: false,
+        recommendedAction: 'Demonstration transaction confirmed.',
+      },
+      logEvent: 'PAYPAL_ORDER_CAPTURED_DEMO',
+      logDetail: `Simulated capture ${captureId} for order ${orderId}`,
+    }, database);
+
     return {
       success: true,
       demoMode: true,
+      isSimulation: true,
       orderId,
       captureId,
       status: 'COMPLETED',
       payer: {
         email_address: 'sandbox-buyer@paybastion.dev',
-        name: { given_name: 'Resilient', surname: 'Tester' }
+        name: { given_name: 'Resilient', surname: 'Tester' },
       },
-      message: 'Simulated Sandbox Capture Verified',
-      completedAt: new Date().toISOString()
+      message: 'Simulated Sandbox Capture Verified (DEMO MODE: Fictional confirmation)',
+      completedAt,
+      transaction: updated,
     };
   }
 
-  const response = await fetch(`${PAYPAL_API_BASE}/v2/checkout/orders/${orderId}/capture`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${token}`,
-      'Prefer': 'return=representation',
-    },
-  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 15000);
 
-  const data = await response.json();
-  if (!response.ok) {
-    throw new Error(data.message || `PayPal Capture Error (${response.status})`);
+  try {
+    const response = await fetch(`${PAYPAL_API_BASE}/v2/checkout/orders/${orderId}/capture`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`,
+        'Prefer': 'return=representation',
+      },
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeoutId);
+    const data = await response.json();
+
+    if (!response.ok) {
+      // If order is already captured upstream
+      if (data.details?.some(d => d.issue === 'ORDER_ALREADY_CAPTURED')) {
+        const updated = updateTransactionState(localTxn.id, TRANSACTION_STATES.CONFIRMED, {
+          confidenceScore: 99,
+          reconciliationStatus: 'RECONCILED',
+          safeToRetry: false,
+          needsReconciliation: false,
+          logEvent: 'PAYPAL_ORDER_ALREADY_CAPTURED',
+          logDetail: `Upstream confirmed order was already captured. Reconciled as CONFIRMED.`,
+        }, database);
+
+        return {
+          success: true,
+          demoMode: false,
+          isSimulation: false,
+          orderId,
+          status: 'COMPLETED',
+          message: 'PayPal confirmed order was already captured upstream. Reconciled.',
+          transaction: updated,
+        };
+      }
+
+      throw new Error(data.message || `PayPal Capture Error (${response.status})`);
+    }
+
+    const captureDetail = data.purchase_units?.[0]?.payments?.captures?.[0];
+    const isCompleted = data.status === 'COMPLETED' || captureDetail?.status === 'COMPLETED';
+    const targetState = isCompleted ? TRANSACTION_STATES.CONFIRMED : TRANSACTION_STATES.PENDING_VERIFICATION;
+    const captureId = captureDetail?.id || `CAP-${data.id}`;
+
+    const updated = updateTransactionState(localTxn.id, targetState, {
+      confidenceScore: isCompleted ? 99 : 70,
+      providerReference: captureId,
+      reconciliationStatus: isCompleted ? 'RECONCILED' : 'PENDING',
+      safeToRetry: false,
+      needsReconciliation: !isCompleted,
+      explanation: {
+        userExplanation: isCompleted
+          ? `PayPal Sandbox payment of $${localTxn.amount} successfully captured.`
+          : 'PayPal capture in-flight; awaiting final confirmation.',
+        technicalDiagnosis: `PayPal Order ${orderId} captured with status ${data.status}. Capture ID: ${captureId}.`,
+        safeToRetry: false,
+        recommendedAction: isCompleted ? 'Transaction is settled. Do not retry.' : 'Wait for capture completion.',
+      },
+      logEvent: 'PAYPAL_CAPTURE_VERIFIED',
+      logDetail: `PayPal Capture ${captureId} verified with status ${data.status}`,
+    }, database);
+
+    return {
+      success: true,
+      demoMode: false,
+      isSimulation: false,
+      orderId: data.id,
+      captureId,
+      status: data.status,
+      payer: data.payer,
+      details: data,
+      completedAt: new Date().toISOString(),
+      transaction: updated,
+    };
+  } catch (err) {
+    clearTimeout(timeoutId);
+    throw err;
   }
-
-  const captureDetail = data.purchase_units?.[0]?.payments?.captures?.[0];
-
-  return {
-    success: true,
-    demoMode: false,
-    orderId: data.id,
-    captureId: captureDetail?.id || `CAP-${data.id}`,
-    status: data.status,
-    payer: data.payer,
-    details: data,
-    completedAt: new Date().toISOString()
-  };
 }
 
 /**
- * Inquire order status directly from PayPal to reconcile uncertain transactions
+ * Inquire Order Status directly from PayPal
  */
 export async function getPayPalOrderStatus(orderId) {
+  if (!orderId) {
+    throw new Error('orderId is required');
+  }
+
   const { configured, token } = await getPayPalAccessToken();
 
   if (!configured || orderId.startsWith('SANDBOX-DEMO-')) {
     return {
       exists: true,
+      demoMode: true,
+      isSimulation: true,
       status: 'COMPLETED',
-      verifiedBy: 'PayBastion Sandbox Reconciler'
+      verifiedBy: 'PayBastion Sandbox Reconciler (Simulated Demo)',
+      note: 'Demo mode simulated response. Live PayPal API credentials not configured in server/.env.',
     };
   }
 
-  const response = await fetch(`${PAYPAL_API_BASE}/v2/checkout/orders/${orderId}`, {
-    method: 'GET',
-    headers: {
-      'Authorization': `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
-  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10000);
 
-  if (response.status === 404) {
-    return { exists: false, status: 'NOT_FOUND' };
+  try {
+    const response = await fetch(`${PAYPAL_API_BASE}/v2/checkout/orders/${orderId}`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeoutId);
+
+    if (response.status === 404) {
+      return { exists: false, status: 'NOT_FOUND' };
+    }
+
+    const data = await response.json();
+    return {
+      exists: true,
+      demoMode: false,
+      isSimulation: false,
+      status: data.status,
+      details: data,
+    };
+  } catch (err) {
+    clearTimeout(timeoutId);
+    throw err;
   }
-
-  const data = await response.json();
-  return {
-    exists: true,
-    status: data.status,
-    details: data
-  };
 }
