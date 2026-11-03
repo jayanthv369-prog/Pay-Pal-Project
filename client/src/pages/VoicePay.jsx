@@ -3,6 +3,7 @@ import { usePayment } from '../context/PaymentContext';
 import { useNetwork } from '../context/NetworkContext';
 import { isSpeechSupported, parseVoiceIntent, speakConfirmation } from '../utils/speechRecognition';
 import { VOICE_PRESETS } from '../utils/mockData';
+import { api } from '../utils/api';
 import { 
   Mic, 
   MicOff, 
@@ -75,10 +76,21 @@ export default function VoicePay() {
   }, [isListening, language]);
 
   /**
-   * Process voice transcript and extract intent
+   * Process voice transcript and extract intent via Backend AI Service (with deterministic fallback)
    */
-  const handleProcessVoiceText = (text, lang) => {
-    const result = parseVoiceIntent(text, lang);
+  const handleProcessVoiceText = async (text, lang) => {
+    let result = null;
+    try {
+      result = await api.parseVoice({ transcript: text, language: lang });
+    } catch (apiErr) {
+      console.warn('Backend voice parse fallback:', apiErr.message);
+      result = parseVoiceIntent(text, lang);
+    }
+
+    if (!result) {
+      result = parseVoiceIntent(text, lang);
+    }
+
     setParsedIntent(result);
     setErrorMsg('');
 

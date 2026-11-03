@@ -1,15 +1,62 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import { usePayment } from '../context/PaymentContext';
+import { api } from '../utils/api';
 import ConfidenceBadge, { STATUS_CONFIGS } from './ConfidenceBadge';
 import { X, ShieldAlert, CheckCircle2, Clock, AlertTriangle, ArrowRight, RefreshCw, KeyRound, Lock, ExternalLink } from 'lucide-react';
 
 export default function StateExplanationModal() {
-  const { selectedTxnForExplanation, setSelectedTxnForExplanation, reconcileTransaction } = usePayment();
+  const { selectedTxnForExplanation, setSelectedTxnForExplanation, reconcileTransaction, retryPayment } = usePayment();
+  const [aiExplanation, setAiExplanation] = useState(null);
+  const [aiLoading, setAiLoading] = useState(false);
+  const [retrying, setRetrying] = useState(false);
+  const [retryError, setRetryError] = useState(null);
+
+  useEffect(() => {
+    if (!selectedTxnForExplanation) {
+      setAiExplanation(null);
+      return;
+    }
+
+    const txn = selectedTxnForExplanation;
+    if (txn.userExplanation && txn.technicalDiagnosis) {
+      setAiExplanation({
+        userExplanation: txn.userExplanation,
+        technicalDiagnosis: txn.technicalDiagnosis,
+        safeToRetry: txn.safeToRetry,
+        recommendedAction: txn.explanation?.recommendedAction || '',
+      });
+      return;
+    }
+
+    setAiLoading(true);
+    api.explainState({
+      state: txn.state,
+      amount: txn.amount,
+      recipient: txn.recipient,
+      failurePoint: txn.technicalDiagnosis,
+    })
+      .then(res => {
+        if (res) setAiExplanation(res);
+      })
+      .catch(e => {
+        console.warn('Explain state API note:', e.message);
+      })
+      .finally(() => {
+        setAiLoading(false);
+      });
+  }, [selectedTxnForExplanation]);
 
   if (!selectedTxnForExplanation) return null;
 
   const txn = selectedTxnForExplanation;
   const config = STATUS_CONFIGS[txn.state] || STATUS_CONFIGS.OUTCOME_UNKNOWN;
+
+  const activeExplanation = aiExplanation || {
+    userExplanation: txn.userExplanation || config.shortDesc,
+    technicalDiagnosis: txn.technicalDiagnosis || 'Idempotency lock active.',
+    safeToRetry: txn.safeToRetry,
+    recommendedAction: txn.explanation?.recommendedAction || '',
+  };
 
   const handleReconcileNow = async () => {
     await reconcileTransaction(txn.id);
@@ -65,7 +112,7 @@ export default function StateExplanationModal() {
               What this means in plain language
             </h4>
             <p className="text-slate-200 leading-relaxed">
-              {txn.userExplanation || config.shortDesc}
+              {activeExplanation.userExplanation}
             </p>
           </div>
 
@@ -79,7 +126,7 @@ export default function StateExplanationModal() {
               <span className="text-[11px] text-slate-500">Idempotency-Protected</span>
             </div>
             <p className="text-slate-300 leading-relaxed">
-              {txn.technicalDiagnosis || 'Idempotency lock active. Pre-flight query confirms zero duplicate charges.'}
+              {activeExplanation.technicalDiagnosis}
             </p>
             <div className="mt-3 pt-2 border-t border-slate-800/60 grid grid-cols-2 gap-2 text-[11px] text-slate-400">
               <div>
@@ -139,7 +186,7 @@ export default function StateExplanationModal() {
         </div>
 
         {/* Footer Actions */}
-        <div className="px-6 py-4 bg-slate-900/80 border-t border-slate-800 flex items-center justify-between">
+        <div className="px-6 py-4 bg-slate-900/80 border-t border-slate-800 flex items-center justify-between gap-2 flex-wrap">
           <button
             type="button"
             onClick={() => setSelectedTxnForExplanation(null)}
@@ -148,17 +195,78 @@ export default function StateExplanationModal() {
             Close
           </button>
 
-          {(txn.state === 'PENDING_VERIFICATION' || txn.state === 'OUTCOME_UNKNOWN') && (
-            <button
-              type="button"
-              onClick={handleReconcileNow}
-              className="px-4 py-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-semibold text-xs rounded-lg flex items-center gap-1.5 shadow-lg shadow-emerald-500/20 transition-all"
-            >
-              <RefreshCw className="w-3.5 h-3.5" />
-              Reconcile via Smart Recovery
-            </button>
-          )}
+          <div className="flex items-center gap-2">
+            {/* Blocked retry button when state is OUTCOME_UNKNOWN */}
+            {txn.state === 'OUTCOME_UNKNOWN' && (
+              <button
+                type="button"
+                disabled={true}
+                title="Payment outcome is unknown. Please use Smart Reconcile before attempting another payment."
+                className="px-3.5 py-2 rounded-lg bg-slate-800/90 text-slate-500 border border-slate-700/60 text-xs font-semibold cursor-not-allowed opacity-60 flex items-center gap-1.5"
+              >
+                <Lock className="w-3.5 h-3.5 text-slate-500" />
+                <span>Retry Payment (Blocked)</span>
+              </button>
+            )}
+
+            {/* Blocked retry button when state is PENDING_VERIFICATION */}
+            {txn.state === 'PENDING_VERIFICATION' && (
+              <button
+                type="button"
+                disabled={true}
+                title="Payment verification is pending. Please use Smart Reconcile before attempting another payment."
+                className="px-3.5 py-2 rounded-lg bg-slate-800/90 text-slate-500 border border-slate-700/60 text-xs font-semibold cursor-not-allowed opacity-60 flex items-center gap-1.5"
+              >
+                <Lock className="w-3.5 h-3.5 text-slate-500" />
+                <span>Retry Payment (Blocked)</span>
+              </button>
+            )}
+
+            {/* Enabled retry button when state is confirmed FAILED */}
+            {txn.state === 'FAILED' && (
+              <button
+                type="button"
+                onClick={async () => {
+                  setRetrying(true);
+                  setRetryError(null);
+                  try {
+                    const res = await retryPayment(txn.id);
+                    if (res && res.success) {
+                      setSelectedTxnForExplanation(null);
+                    } else {
+                      setRetryError(res?.message || 'Retry failed');
+                    }
+                  } catch (err) {
+                    setRetryError(err.message);
+                  } finally {
+                    setRetrying(false);
+                  }
+                }}
+                disabled={retrying}
+                className="px-4 py-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-semibold text-xs rounded-lg flex items-center gap-1.5 shadow-lg shadow-emerald-500/20 transition-all disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${retrying ? 'animate-spin' : ''}`} />
+                <span>{retrying ? 'Retrying...' : 'Retry Payment (Fresh Key)'}</span>
+              </button>
+            )}
+
+            {(txn.state === 'PENDING_VERIFICATION' || txn.state === 'OUTCOME_UNKNOWN') && (
+              <button
+                type="button"
+                onClick={handleReconcileNow}
+                className="px-4 py-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-semibold text-xs rounded-lg flex items-center gap-1.5 shadow-lg shadow-emerald-500/20 transition-all"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                Reconcile via Smart Recovery
+              </button>
+            )}
+          </div>
         </div>
+        {retryError && (
+          <div className="px-6 py-2 bg-rose-500/10 border-t border-rose-500/30 text-rose-300 text-xs">
+            {retryError}
+          </div>
+        )}
       </div>
     </div>
   );

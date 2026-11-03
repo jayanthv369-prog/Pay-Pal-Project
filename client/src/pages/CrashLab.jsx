@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { usePayment } from '../context/PaymentContext';
 import { useNetwork, NETWORK_MODES } from '../context/NetworkContext';
+import { api } from '../utils/api';
 import ConfidenceBadge from '../components/ConfidenceBadge';
 import { 
   Flame, 
@@ -102,7 +103,7 @@ const SCENARIOS = [
     expectedState: 'CREDIT_FALLBACK_DISBURSED (Simulation)',
     systemResponse: 'With explicit user consent, simulated micro-credit pool covers merchant payment. Zero interest 7-day schedule established.',
     steps: [
-      { step: 'Outage', desc: 'User attempts ₹450 medicine payment; bank switch 500 downtime' },
+      { step: 'Outage', desc: 'User attempts ₹250 medicine payment; bank switch 500 downtime' },
       { step: 'Offer', desc: 'Credit Bridge detects critical merchant category; prompts fallback' },
       { step: 'Consent', desc: 'User reviews simulation terms and grants consent' },
       { step: 'Disburse', desc: 'Simulated bridge covers merchant; user account is safe' }
@@ -111,7 +112,7 @@ const SCENARIOS = [
 ];
 
 export default function CrashLab() {
-  const { addTransaction, triggerCelebration } = usePayment();
+  const { addTransaction, triggerCelebration, reconcileTransaction, retryPayment, transactions, refreshData } = usePayment();
   const { setNetworkMode, NETWORK_MODES } = useNetwork();
 
   const [selectedScenario, setSelectedScenario] = useState(SCENARIOS[0]);
@@ -119,8 +120,63 @@ export default function CrashLab() {
   const [currentStepIdx, setCurrentStepIdx] = useState(0);
   const [executionLogs, setExecutionLogs] = useState([]);
   const [completed, setCompleted] = useState(false);
+  const [lastScenarioTxn, setLastScenarioTxn] = useState(null);
+  const [reconciling, setReconciling] = useState(false);
+  const [retrying, setRetrying] = useState(false);
+  const [retryNotice, setRetryNotice] = useState(null);
 
-  const handleRunScenario = async (sc) => {
+  // Sync with context updates when transaction is reconciled or updated
+  const currentTxn = transactions.find(t => t.id === lastScenarioTxn?.id) || lastScenarioTxn;
+
+  const handleSmartReconcile = async () => {
+    if (!currentTxn) return;
+    setReconciling(true);
+    setRetryNotice(null);
+    try {
+      const res = await reconcileTransaction(currentTxn.id);
+      if (res && res.transaction) {
+        setLastScenarioTxn(res.transaction);
+      }
+    } catch (err) {
+      console.warn('Reconcile failed:', err.message);
+    } finally {
+      setReconciling(false);
+    }
+  };
+
+  const handleFreshRetry = async () => {
+    if (!currentTxn) return;
+    if (currentTxn.state === 'OUTCOME_UNKNOWN') {
+      setRetryNotice('Payment outcome is unknown. Please use Smart Reconcile before attempting another payment.');
+      return;
+    }
+    if (currentTxn.state === 'PENDING_VERIFICATION') {
+      setRetryNotice('Payment verification is pending. Please use Smart Reconcile before attempting another payment.');
+      return;
+    }
+    if (currentTxn.state !== 'FAILED' && !currentTxn.safeToRetry) {
+      setRetryNotice('Only confirmed failed transactions can be retried.');
+      return;
+    }
+
+    setRetrying(true);
+    setRetryNotice(null);
+    try {
+      const res = await retryPayment(currentTxn.id);
+      if (res && res.transaction) {
+        setLastScenarioTxn(res.transaction);
+        setRetryNotice(`Fresh retry initiated successfully with new key: ${res.transaction.idempotencyKey}`);
+      } else {
+        setRetryNotice(res?.message || 'Retry failed');
+      }
+    } catch (err) {
+      setRetryNotice(err.message || 'Retry rejected by server.');
+    } finally {
+      setRetrying(false);
+    }
+  };
+
+  const handleRunScenario = async (sc, isRetry = false) => {
     setSelectedScenario(sc);
     setRunning(true);
     setCompleted(false);
@@ -142,49 +198,103 @@ export default function CrashLab() {
       await new Promise((r) => setTimeout(r, 700));
     }
 
-    // Insert scenario-specific transaction into feed to demonstrate real state change
-    if (sc.id === 'SCENARIO_1_NETWORK_DROP') {
-      addTransaction({
-        id: `TXN-CRASH-01-${Date.now().toString().slice(-4)}`,
-        idempotencyKey: `IDEMP-CRASH-01-${Date.now()}`,
-        amount: 650.00,
-        currency: 'INR',
-        sender: 'user-ananya@okaxis',
-        recipient: 'merchant-terminal@kotak',
-        recipientName: 'Crash Lab Test Merchant',
-        channel: 'CRASH_SIMULATION',
-        state: 'OUTCOME_UNKNOWN',
-        confidenceScore: 30,
-        createdAt: new Date().toISOString(),
-        safeToRetry: false,
-        needsReconciliation: true,
-        userExplanation: 'Simulated network drop. Idempotency lock held to prevent duplicate payment.',
-        technicalDiagnosis: 'Packet loss injected. Awaiting non-debit provider check.',
-        logs: [
-          { timestamp: new Date().toISOString(), event: 'CRASH_INJECTED', detail: 'Simulated 100% packet loss during transmission' }
-        ]
+    // Execute real backend simulation scenario
+    try {
+      const scenarioParams = isRetry && lastScenarioTxn
+        ? { isRetry: true, idempotencyKey: lastScenarioTxn.idempotencyKey, txId: lastScenarioTxn.id }
+        : { isRetry: false };
+
+      const backendResult = await api.runSimulationScenario(sc.id, scenarioParams);
+      if (backendResult?.transaction) {
+        setLastScenarioTxn(backendResult.transaction);
+        addTransaction(backendResult.transaction);
+
+        if (backendResult.isExisting || (isRetry && backendResult.transaction._isExisting)) {
+          logs.push({
+            time: new Date().toLocaleTimeString(),
+            step: 'Idempotent Catch',
+            desc: `Duplicate debit blocked! Upstream engine detected existing key ${backendResult.transaction.idempotencyKey}. State remains ${backendResult.transaction.state}.`,
+          });
+          setExecutionLogs([...logs]);
+        }
+      }
+      if (backendResult?.creditResult) {
+        if (typeof refreshData === 'function') {
+          await refreshData();
+        }
+        triggerCelebration();
+      }
+    } catch (apiErr) {
+      console.warn('Crash Lab backend call note:', apiErr.message);
+      logs.push({
+        time: new Date().toLocaleTimeString(),
+        step: 'Execution Notice',
+        desc: apiErr.message || 'Simulation execution stopped by business rule',
       });
-    } else if (sc.id === 'SCENARIO_2_TIMEOUT_ACK') {
-      addTransaction({
-        id: `TXN-CRASH-02-${Date.now().toString().slice(-4)}`,
-        idempotencyKey: `IDEMP-CRASH-02-${Date.now()}`,
-        amount: 1200.00,
-        currency: 'INR',
-        sender: 'user-ananya@okaxis',
-        recipient: 'metro-supermarket@icici',
-        recipientName: 'Metro Supermarket',
-        channel: 'CRASH_SIMULATION',
-        state: 'CONFIRMED',
-        confidenceScore: 99,
-        createdAt: new Date().toISOString(),
-        safeToRetry: false,
-        userExplanation: 'Clearinghouse confirmed existing debit of ₹1,200. Reconciled successfully without duplicate charge.',
-        technicalDiagnosis: 'Timeout occurred at ACK phase. Pre-flight inquiry recovered UTR-982190.',
-        logs: [
-          { timestamp: new Date().toISOString(), event: 'TIMEOUT_RECONCILED', detail: 'Original order captured. Duplicate payment prevented.' }
-        ]
-      });
-      triggerCelebration();
+      setExecutionLogs([...logs]);
+      setRetryNotice(apiErr.message);
+      // Client fallback
+      if (sc.id === 'SCENARIO_1_NETWORK_DROP') {
+        const fallbackKey = isRetry && lastScenarioTxn
+          ? lastScenarioTxn.idempotencyKey
+          : `IDEMP-CRASH-01-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+        const fallbackId = isRetry && lastScenarioTxn
+          ? lastScenarioTxn.id
+          : `TXN-CRASH-01-${Date.now().toString().slice(-4)}`;
+
+        const clientTx = {
+          id: fallbackId,
+          idempotencyKey: fallbackKey,
+          amount: 650.00,
+          currency: 'INR',
+          sender: 'user-ananya@okaxis',
+          recipient: 'merchant-terminal@kotak',
+          recipientName: 'Crash Lab Test Merchant',
+          channel: 'CRASH_SIMULATION',
+          state: 'OUTCOME_UNKNOWN',
+          confidenceScore: 30,
+          createdAt: new Date().toISOString(),
+          safeToRetry: false,
+          needsReconciliation: true,
+          userExplanation: 'Simulated network drop. Idempotency lock held to prevent duplicate payment.',
+          technicalDiagnosis: 'Packet loss injected. Awaiting non-debit provider check.',
+          logs: [
+            { timestamp: new Date().toISOString(), event: 'CRASH_INJECTED', detail: 'Simulated 100% packet loss during transmission' }
+          ]
+        };
+        setLastScenarioTxn(clientTx);
+        addTransaction(clientTx);
+      } else if (sc.id === 'SCENARIO_2_TIMEOUT_ACK') {
+        const fallbackKey = isRetry && lastScenarioTxn
+          ? lastScenarioTxn.idempotencyKey
+          : `IDEMP-CRASH-02-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+        const fallbackId = isRetry && lastScenarioTxn
+          ? lastScenarioTxn.id
+          : `TXN-CRASH-02-${Date.now().toString().slice(-4)}`;
+
+        const clientTx = {
+          id: fallbackId,
+          idempotencyKey: fallbackKey,
+          amount: 1200.00,
+          currency: 'INR',
+          sender: 'user-ananya@okaxis',
+          recipient: 'metro-supermarket@icici',
+          recipientName: 'Metro Supermarket',
+          channel: 'CRASH_SIMULATION',
+          state: 'CONFIRMED',
+          confidenceScore: 99,
+          createdAt: new Date().toISOString(),
+          safeToRetry: false,
+          userExplanation: 'Clearinghouse confirmed existing debit of ₹1,200. Reconciled successfully without duplicate charge.',
+          technicalDiagnosis: 'Timeout occurred at ACK phase. Pre-flight inquiry recovered UTR-982190.',
+          logs: [
+            { timestamp: new Date().toISOString(), event: 'TIMEOUT_RECONCILED', detail: 'Original order captured. Duplicate payment prevented.' }
+          ]
+        };
+        setLastScenarioTxn(clientTx);
+        addTransaction(clientTx);
+        triggerCelebration();
+      }
     }
 
     setRunning(false);
@@ -261,15 +371,124 @@ export default function CrashLab() {
             <h2 className="text-xl font-bold text-white mt-1">{selectedScenario.title}</h2>
           </div>
 
-          <button
-            onClick={() => handleRunScenario(selectedScenario)}
-            disabled={running}
-            className="px-4 py-2.5 rounded-xl bg-orange-500 hover:bg-orange-400 text-slate-950 font-bold text-xs flex items-center gap-2 shadow-lg shadow-orange-500/20 transition-all self-start md:self-auto disabled:opacity-50"
-          >
-            {running ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
-            <span>{running ? 'Executing Step Pipeline...' : 'Re-Run Scenario'}</span>
-          </button>
+          <div className="flex items-center gap-2 self-start md:self-auto flex-wrap">
+            {/* When OUTCOME_UNKNOWN or PENDING_VERIFICATION: Retry button is DISABLED */}
+            {currentTxn && (currentTxn.state === 'OUTCOME_UNKNOWN' || currentTxn.state === 'PENDING_VERIFICATION') && (
+              <>
+                <button
+                  type="button"
+                  disabled={true}
+                  title={currentTxn.state === 'OUTCOME_UNKNOWN'
+                    ? "Payment outcome is unknown. Please use Smart Reconcile before attempting another payment."
+                    : "Payment verification is pending. Please use Smart Reconcile before attempting another payment."}
+                  className="px-3.5 py-2.5 rounded-xl bg-slate-900/90 text-slate-500 border border-slate-700/60 font-bold text-xs flex items-center gap-1.5 cursor-not-allowed opacity-60"
+                >
+                  <Lock className="w-3.5 h-3.5 text-slate-500" />
+                  <span>Retry Payment (Blocked)</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={handleSmartReconcile}
+                  disabled={reconciling || running}
+                  className="px-3.5 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs flex items-center gap-1.5 shadow-lg shadow-emerald-500/20 transition-all disabled:opacity-50"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${reconciling ? 'animate-spin' : ''}`} />
+                  <span>{reconciling ? 'Reconciling with Bank...' : 'Run Smart Reconcile'}</span>
+                </button>
+              </>
+            )}
+
+            {/* When transaction is confirmed FAILED: Safe retry button is ENABLED */}
+            {currentTxn && currentTxn.state === 'FAILED' && (
+              <button
+                type="button"
+                onClick={handleFreshRetry}
+                disabled={retrying || running}
+                className="px-3.5 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs flex items-center gap-1.5 shadow-lg shadow-emerald-500/20 transition-all disabled:opacity-50"
+                title="Smart Reconcile confirmed no debit occurred. Click to retry safely with a new idempotency key."
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${retrying ? 'animate-spin' : ''}`} />
+                <span>{retrying ? 'Initiating Fresh Attempt...' : 'Retry Payment (Fresh Key)'}</span>
+              </button>
+            )}
+
+            <button
+              onClick={() => handleRunScenario(selectedScenario, false)}
+              disabled={running}
+              className="px-4 py-2.5 rounded-xl bg-orange-500 hover:bg-orange-400 text-slate-950 font-bold text-xs flex items-center gap-2 shadow-lg shadow-orange-500/20 transition-all disabled:opacity-50"
+            >
+              {running ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
+              <span>{running ? 'Executing Step Pipeline...' : 'Run Scenario (Fresh Key)'}</span>
+            </button>
+          </div>
         </div>
+
+        {/* State & Retry Protection Banner */}
+        {currentTxn && (
+          <div>
+            {currentTxn.state === 'OUTCOME_UNKNOWN' && (
+              <div className="p-3.5 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-300 text-xs flex items-center justify-between gap-3 flex-wrap">
+                <div className="flex items-center gap-2">
+                  <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+                  <span className="font-medium">
+                    Payment outcome is unknown. Please use Smart Reconcile before attempting another payment.
+                  </span>
+                </div>
+                <span className="text-[11px] font-mono text-amber-400/80 bg-amber-500/10 px-2 py-0.5 rounded border border-amber-500/20">
+                  Idempotency Locked: {currentTxn.idempotencyKey}
+                </span>
+              </div>
+            )}
+
+            {currentTxn.state === 'PENDING_VERIFICATION' && (
+              <div className="p-3.5 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-300 text-xs flex items-center justify-between gap-3 flex-wrap">
+                <div className="flex items-center gap-2">
+                  <Clock className="w-4 h-4 text-amber-400 shrink-0" />
+                  <span className="font-medium">
+                    Payment verification is pending. Please use Smart Reconcile before attempting another payment.
+                  </span>
+                </div>
+                <span className="text-[11px] font-mono text-amber-400/80 bg-amber-500/10 px-2 py-0.5 rounded border border-amber-500/20">
+                  Verification Pending
+                </span>
+              </div>
+            )}
+
+            {currentTxn.state === 'FAILED' && (
+              <div className="p-3.5 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs flex items-center justify-between gap-3 flex-wrap">
+                <div className="flex items-center gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                  <span className="font-medium">
+                    Smart Reconcile confirmed no debit occurred. You may safely retry using a fresh idempotency key.
+                  </span>
+                </div>
+                <span className="text-[11px] font-mono text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20">
+                  Safe To Retry: TRUE
+                </span>
+              </div>
+            )}
+
+            {currentTxn.state === 'CONFIRMED' && (
+              <div className="p-3.5 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs flex items-center justify-between gap-3 flex-wrap">
+                <div className="flex items-center gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                  <span className="font-medium">
+                    Bank ledger confirmed payment was captured. Duplicate debits prevented.
+                  </span>
+                </div>
+                <span className="text-[11px] font-mono text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20">
+                  CONFIRMED
+                </span>
+              </div>
+            )}
+
+            {retryNotice && (
+              <div className="mt-2 p-2.5 rounded-lg bg-sky-500/10 border border-sky-500/30 text-sky-300 text-xs font-mono">
+                {retryNotice}
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Live Stepper Visualization */}
         <div className="space-y-3">

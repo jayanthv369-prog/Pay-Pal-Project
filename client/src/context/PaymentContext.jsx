@@ -1,7 +1,8 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
 import confetti from 'canvas-confetti';
 import { INITIAL_TRANSACTIONS, SIMULATED_CREDIT_PROFILE } from '../utils/mockData.js';
 import { generateAuthId, generateNonce, signPayloadWebCrypto, verifySignatureWebCrypto } from '../utils/cryptoUtils.js';
+import { api } from '../utils/api.js';
 
 const PaymentContext = createContext();
 
@@ -44,23 +45,82 @@ export function PaymentProvider({ children }) {
 
   // 5. Active Explanation Modal State
   const [selectedTxnForExplanation, setSelectedTxnForExplanation] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [backendConnected, setBackendConnected] = useState(false);
 
-  // Sync to local storage
+  // Sync to local storage for offline resilience
   useEffect(() => {
-    localStorage.setItem('paybastion_txns', JSON.stringify(transactions));
+    try {
+      localStorage.setItem('paybastion_txns', JSON.stringify(transactions));
+    } catch (e) { /* ignore */ }
   }, [transactions]);
 
   useEffect(() => {
-    localStorage.setItem('paybastion_offline_passports', JSON.stringify(offlinePassports));
+    try {
+      localStorage.setItem('paybastion_offline_passports', JSON.stringify(offlinePassports));
+    } catch (e) { /* ignore */ }
   }, [offlinePassports]);
 
   useEffect(() => {
-    localStorage.setItem('paybastion_merchant_journal', JSON.stringify(merchantJournal));
+    try {
+      localStorage.setItem('paybastion_merchant_journal', JSON.stringify(merchantJournal));
+    } catch (e) { /* ignore */ }
   }, [merchantJournal]);
 
   useEffect(() => {
-    localStorage.setItem('paybastion_credit_profile', JSON.stringify(creditProfile));
+    try {
+      localStorage.setItem('paybastion_credit_profile', JSON.stringify(creditProfile));
+    } catch (e) { /* ignore */ }
   }, [creditProfile]);
+
+  /**
+   * Load initial data from persistent SQLite backend
+   */
+  const refreshData = useCallback(async () => {
+    try {
+      setLoading(true);
+      // Fetch transactions
+      const txData = await api.fetchTransactions({ limit: 50 });
+      if (txData && Array.isArray(txData.transactions)) {
+        setTransactions(txData.transactions);
+        setBackendConnected(true);
+      }
+
+      // Fetch offline passports
+      try {
+        const passData = await api.fetchOfflinePassports();
+        if (passData && Array.isArray(passData.passports)) {
+          setOfflinePassports(passData.passports);
+        }
+      } catch (e) { /* ignore */ }
+
+      // Fetch merchant journal
+      try {
+        const jData = await api.fetchMerchantJournal();
+        if (jData && Array.isArray(jData.journal)) {
+          setMerchantJournal(jData.journal);
+        }
+      } catch (e) { /* ignore */ }
+
+      // Fetch credit profile
+      try {
+        const cProfile = await api.fetchCreditProfile();
+        if (cProfile && cProfile.userId) {
+          setCreditProfile(cProfile);
+        }
+      } catch (e) { /* ignore */ }
+
+    } catch (err) {
+      console.warn('Backend initial fetch note (using persistent cache):', err.message);
+      setBackendConnected(false);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshData();
+  }, [refreshData]);
 
   /**
    * Celebrate with confetti on recovery / payment confirmation
@@ -71,86 +131,108 @@ export function PaymentProvider({ children }) {
         particleCount: 50,
         spread: 60,
         origin: { y: 0.7 },
-        colors: ['#10b981', '#38bdf8', '#fbbf24']
+        colors: ['#10b981', '#38bdf8', '#fbbf24'],
       });
     } catch (e) { /* ignore */ }
   };
 
   /**
-   * Add a new transaction
+   * Add a new transaction (persisting to SQLite backend)
    */
-  const addTransaction = (txn) => {
-    setTransactions(prev => [txn, ...prev]);
+  const addTransaction = async (txn) => {
+    // Optimistically update UI
+    setTransactions(prev => [txn, ...prev.filter(t => t.id !== txn.id)]);
+
+    try {
+      const created = await api.createTransaction({
+        id: txn.id,
+        idempotencyKey: txn.idempotencyKey,
+        amount: txn.amount,
+        currency: txn.currency || 'INR',
+        sender: txn.sender,
+        recipient: txn.recipient,
+        recipientName: txn.recipientName,
+        category: txn.category,
+        channel: txn.channel,
+        state: txn.state,
+        confidenceScore: txn.confidenceScore,
+        userExplanation: txn.userExplanation,
+        technicalDiagnosis: txn.technicalDiagnosis,
+        safeToRetry: txn.safeToRetry,
+        logs: txn.logs,
+      });
+      if (created) {
+        setTransactions(prev => [created, ...prev.filter(t => t.id !== created.id)]);
+      }
+    } catch (err) {
+      console.warn('Backend create transaction note (stored locally):', err.message);
+    }
   };
 
   /**
    * Smart Recovery Reconciler
-   * Checks original payment provider using idempotency key before deciding outcome
+   * Queries original payment provider using idempotency key before deciding outcome
    */
   const reconcileTransaction = async (txnId, forcedOutcome = null) => {
-    const txn = transactions.find(t => t.id === txnId);
+    const txn = transactions.find(t => t.id === txnId || t.idempotencyKey === txnId);
     if (!txn) return { success: false, message: 'Transaction not found' };
 
     try {
-      // First attempt backend call if server is running
       let result = null;
       try {
-        const res = await fetch('/api/recovery/reconcile', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            idempotencyKey: txn.idempotencyKey,
-            amount: txn.amount,
-            recipient: txn.recipient,
-            simulatedOutcome: forcedOutcome,
-          }),
+        result = await api.reconcileTransaction({
+          idempotencyKey: txn.idempotencyKey,
+          amount: txn.amount,
+          recipient: txn.recipient,
+          simulatedOutcome: forcedOutcome,
+          provider: txn.channel === 'PAYPAL_SANDBOX' ? 'PAYPAL' : 'UPI_GATEWAY',
+          orderId: txn.id?.startsWith('PAYPAL-') ? txn.id.replace('PAYPAL-', '') : null,
         });
-        if (res.ok) {
-          result = await res.json();
-        }
       } catch (netErr) {
-        // Backend not reached, proceed with client-side deterministic reconciliation
+        console.warn('Backend reconcile not reachable, using offline reconciler:', netErr.message);
       }
 
-      const outcome = forcedOutcome || (txn.state === 'OUTCOME_UNKNOWN' ? 'CONFIRMED' : 'CONFIRMED');
-      const resolvedState = result?.reconciliationResult?.resolvedState || outcome;
+      const resolvedState = result?.reconciliationResult?.resolvedState || forcedOutcome || txn.state;
       const explanation = result?.reconciliationResult?.explanation || {
-        userExplanation: resolvedState === 'CONFIRMED' 
-          ? `Clearinghouse confirmed debit of ₹${txn.amount}. Bank Reference UTR-${Date.now().toString().slice(-8)}. Original transaction verified. Duplicate payment prevented.`
-          : 'Payment rejected upstream. No funds deducted.',
-        technicalDiagnosis: 'Idempotency key re-queried upstream. Lock released safely.',
+        userExplanation: resolvedState === 'CONFIRMED'
+          ? `Clearinghouse confirmed debit of ₹${txn.amount}. Reference: ${result?.reconciliationResult?.providerReference || 'UTR-' + Date.now().toString().slice(-8)}. Original transaction verified. Zero duplicate risk.`
+          : (resolvedState === 'FAILED'
+            ? 'The payment provider confirmed zero funds were debited from your account. It is safe to retry.'
+            : 'Payment outcome remains uncertain. Idempotency lock held to prevent duplicate debit.'),
+        technicalDiagnosis: 'Idempotency key re-queried upstream. Lock state verified.',
         safeToRetry: resolvedState === 'FAILED',
-        recommendedAction: resolvedState === 'CONFIRMED' ? 'Do NOT retry. Receipt is valid.' : 'Safe to re-initiate.'
+        recommendedAction: resolvedState === 'CONFIRMED'
+          ? 'Do NOT retry. Receipt is valid.'
+          : (resolvedState === 'FAILED' ? 'Safe to re-initiate with a new payment.' : 'Hold tight. Awaiting bank reconciliation.'),
       };
 
-      setTransactions(prev => prev.map(t => {
-        if (t.id === txnId) {
-          return {
-            ...t,
-            state: resolvedState,
-            confidenceScore: resolvedState === 'CONFIRMED' ? 99 : 100,
-            userExplanation: explanation.userExplanation,
-            technicalDiagnosis: explanation.technicalDiagnosis,
-            safeToRetry: explanation.safeToRetry,
-            needsReconciliation: false,
-            logs: [
-              ...t.logs,
-              {
-                timestamp: new Date().toISOString(),
-                event: 'RECONCILED_BY_SMART_RECOVERY',
-                detail: `Idempotency verification: ${resolvedState}. Provider verified.`
-              }
-            ]
-          };
-        }
-        return t;
-      }));
+      const updatedTx = result?.transaction || {
+        ...txn,
+        state: resolvedState,
+        confidenceScore: resolvedState === 'CONFIRMED' ? 99 : 100,
+        userExplanation: explanation.userExplanation,
+        technicalDiagnosis: explanation.technicalDiagnosis,
+        safeToRetry: explanation.safeToRetry,
+        needsReconciliation: false,
+        reconciliationStatus: 'RECONCILED',
+        providerReference: result?.reconciliationResult?.providerReference || txn.providerReference,
+        logs: [
+          ...(txn.logs || []),
+          {
+            timestamp: new Date().toISOString(),
+            event: 'RECONCILED_BY_SMART_RECOVERY',
+            detail: `Idempotency verification: ${resolvedState}. Provider verified.`,
+          },
+        ],
+      };
+
+      setTransactions(prev => prev.map(t => (t.id === txn.id ? updatedTx : t)));
 
       if (resolvedState === 'CONFIRMED') {
         triggerCelebration();
       }
 
-      return { success: true, resolvedState, explanation };
+      return { success: true, resolvedState, explanation, transaction: updatedTx };
     } catch (err) {
       console.error('Reconciliation error:', err);
       return { success: false, message: err.message };
@@ -158,74 +240,164 @@ export function PaymentProvider({ children }) {
   };
 
   /**
+   * Retry Payment:
+   * Blocked if transaction is OUTCOME_UNKNOWN or PENDING_VERIFICATION.
+   * Only allowed after Smart Reconcile confirms transaction FAILED.
+   * Strictly uses a NEW idempotency key.
+   */
+  const retryPayment = async (txnId) => {
+    const txn = transactions.find(t => t.id === txnId || t.idempotencyKey === txnId);
+    if (!txn) {
+      return { success: false, message: 'Transaction not found' };
+    }
+
+    if (txn.state === 'OUTCOME_UNKNOWN') {
+      return {
+        success: false,
+        blocked: true,
+        code: 'RETRY_BLOCKED_OUTCOME_UNKNOWN',
+        message: 'Payment outcome is unknown. Please use Smart Reconcile before attempting another payment.',
+      };
+    }
+
+    if (txn.state === 'PENDING_VERIFICATION') {
+      return {
+        success: false,
+        blocked: true,
+        code: 'RETRY_BLOCKED_PENDING',
+        message: 'Payment verification is pending. Please use Smart Reconcile before attempting another payment.',
+      };
+    }
+
+    if (txn.state !== 'FAILED' && !txn.safeToRetry) {
+      return {
+        success: false,
+        blocked: true,
+        code: 'RETRY_NOT_PERMITTED',
+        message: 'Only failed or non-debited transactions may be retried.',
+      };
+    }
+
+    const newIdempotencyKey = `IDEMP-RETRY-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
+
+    try {
+      const res = await api.retryTransaction(txn.id, {
+        newIdempotencyKey,
+        amount: txn.amount,
+      });
+
+      if (res && res.transaction) {
+        setTransactions(prev => [res.transaction, ...prev]);
+        return { success: true, transaction: res.transaction };
+      }
+      return { success: false, message: res?.message || 'Retry failed' };
+    } catch (err) {
+      console.warn('Backend retry call note:', err.message);
+      return { success: false, message: err.message };
+    }
+  };
+
+  /**
    * Create an Offline Payment Passport Token
    */
-  const createOfflinePassport = async ({ amount, recipientId = 'merchant-kiosk@axis', recipientName = 'Transit / Kiosk', expiryMinutes = 15 }) => {
-    const authId = generateAuthId();
-    const nonce = generateNonce();
-    const expiresAt = new Date(Date.now() + expiryMinutes * 60000).toISOString();
-    const createdAt = new Date().toISOString();
+  const createOfflinePassport = async ({
+    amount,
+    recipientId = 'namma-metro-kiosk@axis',
+    recipientName = 'Transit / Kiosk',
+    expiryMinutes = 15,
+  }) => {
+    let passport = null;
 
-    const payload = {
-      authId,
-      senderId: 'user-ananya@paybastion',
-      recipientId,
-      recipientName,
-      amount: parseFloat(amount),
-      currency: 'INR',
-      nonce,
-      createdAt,
-      expiresAt,
-      version: 'PayBastion-v1.0-Offline',
-      status: 'SETTLEMENT_PENDING',
-    };
+    try {
+      passport = await api.signOfflinePassport({
+        amount: parseFloat(amount),
+        recipientId,
+        recipientName,
+        senderId: 'user-ananya@paybastion',
+        expiryMinutes,
+      });
+    } catch (err) {
+      console.warn('Backend sign offline not reachable; using client WebCrypto:', err.message);
+      // Offline fallback: Client WebCrypto signing
+      const authId = generateAuthId();
+      const nonce = generateNonce();
+      const expiresAt = new Date(Date.now() + expiryMinutes * 60000).toISOString();
+      const createdAt = new Date().toISOString();
 
-    // Cryptographic signature (Browser WebCrypto for offline autonomy)
-    const signature = await signPayloadWebCrypto(payload);
-    payload.signature = signature;
+      passport = {
+        authId,
+        senderId: 'user-ananya@paybastion',
+        recipientId,
+        recipientName,
+        amount: parseFloat(amount),
+        currency: 'INR',
+        nonce,
+        createdAt,
+        expiresAt,
+        version: 'PayBastion-v1.0-Offline',
+        status: 'SETTLEMENT_PENDING',
+      };
+      passport.signature = await signPayloadWebCrypto(passport);
+    }
 
     // Record in local offline passports
-    setOfflinePassports(prev => [payload, ...prev]);
+    setOfflinePassports(prev => [passport, ...prev]);
 
     // Record corresponding entry in main transaction feed
     const offlineTxn = {
-      id: authId,
-      idempotencyKey: `IDEMP-${authId}`,
+      id: passport.authId,
+      idempotencyKey: `IDEMP-${passport.authId}`,
       amount: parseFloat(amount),
       currency: 'INR',
-      sender: 'user-ananya@paybastion',
+      sender: passport.senderId || 'user-ananya@paybastion',
       recipient: recipientId,
       recipientName,
       category: 'Offline Transit / Retail',
       channel: 'OFFLINE_PASSPORT',
       state: 'OFFLINE_AUTHORIZATION',
       confidenceScore: 88,
-      createdAt,
-      expiresAt,
-      nonce,
-      signature,
+      createdAt: passport.createdAt || new Date().toISOString(),
+      expiresAt: passport.expiresAt,
+      nonce: passport.nonce,
+      signature: passport.signature,
       settlementPending: true,
       userExplanation: 'Offline cryptographically signed authorization generated. Funds held pending merchant batch sync.',
-      technicalDiagnosis: `HMAC-SHA256 signature generated locally. Nonce ${nonce.substring(0, 10)}... protected.`,
+      technicalDiagnosis: `HMAC-SHA256 signature generated. Nonce ${passport.nonce.substring(0, 10)}... protected.`,
       safeToRetry: false,
       logs: [
-        { timestamp: createdAt, event: 'OFFLINE_AUTH_CREATED', detail: `Authorized ₹${amount} with ${expiryMinutes}m TTL.` }
-      ]
+        {
+          timestamp: new Date().toISOString(),
+          event: 'OFFLINE_AUTH_CREATED',
+          detail: `Authorized ₹${amount} with ${expiryMinutes}m TTL.`,
+        },
+      ],
     };
 
-    setTransactions(prev => [offlineTxn, ...prev]);
+    setTransactions(prev => [offlineTxn, ...prev.filter(t => t.id !== offlineTxn.id)]);
 
-    return payload;
+    return passport;
   };
 
   /**
    * Merchant Terminal Verification: Scan & Validate an Offline Authorization
    */
   const verifyOfflinePassport = async (passportData) => {
-    const { authId, nonce, expiresAt, signature, amount, recipientId } = passportData;
+    try {
+      const backendResult = await api.verifyOfflinePassport(passportData);
+      if (backendResult) {
+        if (backendResult.valid && backendResult.journalEntry) {
+          setMerchantJournal(prev => [backendResult.journalEntry, ...prev.filter(j => j.nonce !== backendResult.journalEntry.nonce)]);
+        }
+        return backendResult;
+      }
+    } catch (err) {
+      console.warn('Backend verify not reachable; using client verification:', err.message);
+    }
+
+    // Client verification fallback
+    const { nonce, expiresAt, signature, amount } = passportData;
     const now = Date.now();
 
-    // 1. Expiry Check
     if (now > new Date(expiresAt).getTime()) {
       return {
         valid: false,
@@ -235,7 +407,6 @@ export function PaymentProvider({ children }) {
       };
     }
 
-    // 2. Replay Check (Has this nonce already been submitted to merchant terminal?)
     const alreadyRedeemed = merchantJournal.find(item => item.nonce === nonce);
     if (alreadyRedeemed) {
       return {
@@ -246,7 +417,6 @@ export function PaymentProvider({ children }) {
       };
     }
 
-    // 3. Cryptographic Signature Verification
     const isValidSignature = await verifySignatureWebCrypto(passportData, signature);
     if (!isValidSignature) {
       return {
@@ -257,7 +427,6 @@ export function PaymentProvider({ children }) {
       };
     }
 
-    // 4. Offline Amount Limit Check
     if (parseFloat(amount) > 2000) {
       return {
         valid: false,
@@ -267,12 +436,11 @@ export function PaymentProvider({ children }) {
       };
     }
 
-    // Valid: Add to merchant journal
     const journalEntry = {
       ...passportData,
       scannedAt: new Date().toISOString(),
       terminalHoldId: `MERCHANT-HOLD-${Date.now().toString(36).toUpperCase()}`,
-      settlementStatus: 'QUEUED_FOR_ONLINE_BATCH',
+      settlementStatus: 'SETTLEMENT_PENDING',
     };
 
     setMerchantJournal(prev => [journalEntry, ...prev]);
@@ -282,7 +450,7 @@ export function PaymentProvider({ children }) {
       code: 'ACCEPTED_FOR_SETTLEMENT',
       title: 'Offline Authorization Accepted',
       message: 'Cryptographic signature verified. Token queued in merchant ledger for batch settlement upon reconnect.',
-      isFinalSettlement: false, // Critical rule: offline auth is never final settlement
+      isFinalSettlement: false,
       journalEntry,
     };
   };
@@ -290,12 +458,34 @@ export function PaymentProvider({ children }) {
   /**
    * Activate Temporary Credit Bridge Fallback
    */
-  const activateCreditBridge = ({ targetTxnId, amount, recipient, recipientName = 'Merchant' }) => {
+  const activateCreditBridge = async ({ targetTxnId, amount, recipient, recipientName = 'Merchant' }) => {
     const numAmount = parseFloat(amount);
     if (numAmount > creditProfile.availableCredit) {
       return { success: false, message: 'Requested amount exceeds available simulated credit limit.' };
     }
 
+    try {
+      const res = await api.activateCreditBridge({
+        targetTxnId,
+        amount: numAmount,
+        recipient,
+        recipientName,
+        consentGiven: true,
+      });
+
+      if (res && res.success) {
+        if (res.creditProfile) setCreditProfile(res.creditProfile);
+        if (res.transaction) {
+          setTransactions(prev => [res.transaction, ...prev.filter(t => t.id !== res.transaction.id)]);
+        }
+        triggerCelebration();
+        return res;
+      }
+    } catch (err) {
+      console.warn('Backend credit activation note (using local fallback):', err.message);
+    }
+
+    // Local fallback
     const bridgeLoanId = `CREDIT-BRIDGE-${Date.now().toString(36).toUpperCase()}`;
     const newUtilized = creditProfile.utilizedCredit + numAmount;
     const newAvailable = creditProfile.creditLimit - newUtilized;
@@ -306,6 +496,8 @@ export function PaymentProvider({ children }) {
       amount: numAmount,
       status: 'PENDING',
       loanId: bridgeLoanId,
+      recipient,
+      recipientName,
     };
 
     setCreditProfile(prev => ({
@@ -315,13 +507,12 @@ export function PaymentProvider({ children }) {
       repaymentSchedule: [...prev.repaymentSchedule, newInstallment],
     }));
 
-    // Record transaction
     const creditTxn = {
       id: bridgeLoanId,
       idempotencyKey: `IDEMP-${bridgeLoanId}`,
       amount: numAmount,
       currency: 'INR',
-      sender: 'PayBastion Temporary Credit Pool',
+      sender: 'PayBastion Temporary Credit Pool (Simulation)',
       recipient,
       recipientName,
       category: 'Emergency Credit Fallback (Simulation)',
@@ -334,20 +525,32 @@ export function PaymentProvider({ children }) {
       technicalDiagnosis: `Disbursed from simulated pool. Scheduled for repayment on ${newInstallment.dueDate}.`,
       safeToRetry: false,
       logs: [
-        { timestamp: new Date().toISOString(), event: 'CREDIT_BRIDGE_DISBURSED', detail: `₹${numAmount} covered merchant payment under demonstration escrow.` }
-      ]
+        { timestamp: new Date().toISOString(), event: 'CREDIT_BRIDGE_DISBURSED', detail: `₹${numAmount} covered merchant payment under demonstration escrow.` },
+      ],
     };
 
     setTransactions(prev => [creditTxn, ...prev]);
     triggerCelebration();
 
-    return { success: true, bridgeLoanId, installment: newInstallment };
+    return { success: true, bridgeLoanId, installment: newInstallment, transaction: creditTxn };
   };
 
   /**
    * Repay a simulated credit installment
    */
-  const repayCreditInstallment = (installmentId) => {
+  const repayCreditInstallment = async (installmentId) => {
+    try {
+      const res = await api.repayCreditInstallment({ installmentId });
+      if (res && res.success && res.creditProfile) {
+        setCreditProfile(res.creditProfile);
+        triggerCelebration();
+        return;
+      }
+    } catch (err) {
+      console.warn('Backend repay installment note (using local calculation):', err.message);
+    }
+
+    // Local fallback
     const installment = creditProfile.repaymentSchedule.find(i => i.id === installmentId);
     if (!installment) return;
 
@@ -358,24 +561,26 @@ export function PaymentProvider({ children }) {
       ...prev,
       utilizedCredit: newUtilized,
       availableCredit: newAvailable,
-      repaymentSchedule: prev.repaymentSchedule.map(i => i.id === installmentId ? { ...i, status: 'REPAID' } : i)
+      repaymentSchedule: prev.repaymentSchedule.map(i => i.id === installmentId ? { ...i, status: 'REPAID' } : i),
     }));
 
     triggerCelebration();
   };
 
   /**
-   * Reset all demo data to initial state (for clean demo presentation)
+   * Reset demo data
    */
-  const resetDemoData = () => {
+  const resetDemoData = async () => {
+    try {
+      await api.resetOfflineReplayCache();
+    } catch (e) { /* ignore */ }
+
     localStorage.removeItem('paybastion_txns');
     localStorage.removeItem('paybastion_offline_passports');
     localStorage.removeItem('paybastion_merchant_journal');
     localStorage.removeItem('paybastion_credit_profile');
-    setTransactions(INITIAL_TRANSACTIONS);
-    setOfflinePassports([]);
-    setMerchantJournal([]);
-    setCreditProfile(SIMULATED_CREDIT_PROFILE);
+
+    await refreshData();
   };
 
   return (
@@ -389,12 +594,16 @@ export function PaymentProvider({ children }) {
         setSelectedTxnForExplanation,
         addTransaction,
         reconcileTransaction,
+        retryPayment,
         createOfflinePassport,
         verifyOfflinePassport,
         activateCreditBridge,
         repayCreditInstallment,
         resetDemoData,
         triggerCelebration,
+        loading,
+        backendConnected,
+        refreshData,
       }}
     >
       {children}
