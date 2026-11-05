@@ -1,3 +1,4 @@
+
 import React, { useState } from 'react';
 import { usePayment } from '../context/PaymentContext';
 import { 
@@ -28,6 +29,7 @@ export default function Navbar({ activeTab, setActiveTab }) {
     { id: 'scam', label: 'Scam Guardian', icon: ShieldAlert },
     { id: 'credit', label: 'Credit Bridge', icon: CreditCard },
     { id: 'crashlab', label: 'Crash Lab', icon: Flame },
+    { id: 'wallet', label: 'My Wallet', icon: Wallet },
     { id: 'paypal', label: 'PayPal Sandbox', icon: Wallet },
   ];
 
@@ -130,3 +132,4 @@ export default function Navbar({ activeTab, setActiveTab }) {
     </header>
   );
 }
+
